@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic AppImage menu resync (appimenu)
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=10m
+AccuracySec=30s
+Unit=appimenu.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync AppImages into the application menu (appimenu)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/appimenu
+
+[Install]
+WantedBy=default.target
