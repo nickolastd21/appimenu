@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch ~/AppFolders for changes and resync application menu entries
+
+[Path]
+PathChanged=%h/AppFolders
+
+[Install]
+WantedBy=default.target

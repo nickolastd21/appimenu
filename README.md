@@ -1,47 +1,57 @@
 # appimenu
 
-AppImages in your application menu, automatically.
+Launcher entries for portable apps, automatically.
 
-Drop an AppImage into `~/AppImages` and `appimenu` gives it a launcher entry with its own icon,
-using the name, comment, categories and icon already packed inside the AppImage. Nothing is
-mounted, nothing is copied into `/usr`, no AppImage runtime or daemon is required.
+Two small syncers, one shared idea: read metadata and icons straight out of a portable app, write
+plain `.desktop` files plus a theme icon, and keep them in step with the folder. Nothing is
+mounted, nothing is copied into `/usr`, no daemon or FUSE required.
 
-It rescans at login, again the moment the folder changes, and every 10 minutes, and it deletes
-entries for AppImages you remove, rename away, or upgrade.
+| tool | watches | apps it handles | accent ring |
+| --- | --- | --- | --- |
+| `appimenu` | `~/AppImages` | single-file AppImages | red |
+| `appfolder-sync` | `~/AppFolders` | extracted tarball/tar.gz folders | blue |
+
+The ring tells the two kinds apart at a glance in the app grid, and is configurable or disabled.
 
 ```
 $ appimenu
 scanned /home/me/AppImages: 8 AppImage entry(s) up to date, 1 stale entry(s) removed
+
+$ appfolder-sync
+scanned /home/me/AppFolders: 1 folder entry(s) up to date, 0 stale entry(s) removed
 ```
 
 ## Why
 
-An AppImage is a single file, and desktop environments expect `.desktop` entries in
-`~/.local/share/applications`. Existing helpers either install a system-wide daemon and a FUSE
-mount watcher, or rewrite entries on every launch. `appimenu` is one bash script plus three
-systemd user units: it reads the AppImage's SquashFS directly with `unsquashfs`, and writes plain
-`.desktop` files that any XDG desktop (GNOME, KDE Plasma, XFCE, Cinnamon) already understands.
+AppImages and extracted tarballs are single files or loose directories, while desktop environments
+expect `.desktop` entries in `~/.local/share/applications`. Existing helpers install a system-wide
+watcher or rewrite entries on every launch. These two tools are bash scripts plus systemd user
+units, writing entries that any XDG desktop (GNOME, KDE Plasma, XFCE, Cinnamon) already reads.
 
-## What it does
+## What they do
 
-- Reads the embedded `.desktop` and icon out of each AppImage, following the internal symlinks
-  LinuxDeploy and AppImageTool leave behind (`AppIcon.png -> usr/share/icons/...`,
-  `name.desktop -> usr/share/applications/...`).
-- Installs the icon into the hicolor theme at the size bucket matching its real pixel size, so
-  large artwork does not blur at 48px.
-- Derives a display name from the filename when an AppImage ships no metadata, stripping version
-  and architecture noise (`LM-Studio-0.4.28-2-x64.AppImage` becomes `LM-Studio`).
-- Draws an accent ring on every installed icon, so AppImage-backed apps are recognisable in the
-  grid. Default is a 2px red ring with 13% rounded corners, close to Yaru's own icon shape. The
-  ring scales with the artwork size so it stays about 2px on screen at launcher icon sizes.
-- Skips partial downloads and corrupt files instead of creating a broken launcher, and keeps the
-  previous entry alive until the file is really gone.
-- Never touches entries it did not generate.
+- Read the `.desktop` that the app itself ships, and use its name, comment, categories, keywords,
+  MIME types, `Terminal`, `StartupNotify` and `StartupWMClass`.
+- Resolve relative launch commands against the app location, keeping arguments such as `%f` and
+  `%U`. `appfolder-sync` also sets `Path=` to the program folder, so apps start in their own
+  directory.
+- Extract the app's own icon, following the symlinks LinuxDeploy and AppImageTool leave behind
+  (`AppIcon.png -> usr/share/icons/...`), and install it into the hicolor theme at the size bucket
+  matching its real pixel size.
+- Fall back to a name derived from the filename or folder when no metadata ships, stripping version
+  and architecture noise (`LM-Studio-0.4.28-2-x64` becomes `LM-Studio`), or to the main executable
+  in the folder when no `.desktop` ships.
+- Draw an accent ring so portable apps are recognisable: rounded corners at 13% of the icon size,
+  close to Yaru's own icon shape, scaled so it reads as about 2px at launcher icon sizes.
+- Ignore partial downloads, corrupt files and unreadable images instead of creating a broken
+  launcher, and keep the previous entry alive until the app is really gone.
+- Delete entries and icons for apps you remove or move away, and never touch entries they did not
+  create.
 
 ## Requirements
 
-- `bash` 4.4+ and `squashfs-tools` (`unsquashfs`)
-- GNU coreutils, `awk`, `find`, `md5sum`
+- `bash` 4.4+ and GNU coreutils (`find`, `awk`, `od`, `md5sum`, `realpath`)
+- `squashfs-tools` (`unsquashfs`) for `appimenu` only
 - optional `python3` with Pillow, for the accent ring (icons install unbordered without it)
 - optional `rsvg-convert` (librsvg), to rasterise SVG icons so they can carry a ring
 - optional `gtk-update-icon-cache` and `update-desktop-database`
@@ -49,62 +59,78 @@ systemd user units: it reads the AppImage's SquashFS directly with `unsquashfs`,
 ## Install
 
 ```sh
-./install.sh
+./install.sh                      # both tools
+./install.sh appfolder-sync       # one tool only
 ```
 
-That copies `appimenu` to `~/.local/bin`, installs three systemd user units, enables them, and
+Copies the scripts to `~/.local/bin`, installs three systemd user units per tool, enables them, and
 runs the first scan:
 
 | unit | effect |
 | --- | --- |
-| `appimenu.service` | one scan, runs at login |
-| `appimenu.path` | rescans within seconds when `~/AppImages` changes |
-| `appimenu.timer` | safety net rescan every 10 minutes |
+| `<tool>.service` | one scan, runs at login |
+| `<tool>.path` | rescans within seconds when the watched folder changes |
+| `<tool>.timer` | safety net rescan every 10 minutes |
 
-No systemd user session? Run `appimenu` from your desktop environment's autostart, or from cron.
+No systemd user session? Run the tools from your desktop environment's autostart, or from cron.
 
-Remove it with `./uninstall.sh`, and also delete the entries and icons it created with
+Remove with `./uninstall.sh`, and also delete the entries and icons they created with
 `./uninstall.sh --purge`.
 
 ## Configuration
 
-Set these in the environment (for systemd units, use `systemctl --user edit appimenu.service`
-and add an `Environment=` line).
+Set these in the environment. For systemd, use `systemctl --user edit appimenu.service` (or the
+`appfolder-sync` one) and add `Environment=` lines.
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `APPIMAGE_DIR` | `~/AppImages` | folder to scan, searched recursively |
+| `APPIMAGE_DIR` | `~/AppImages` | AppImage folder scanned by `appimenu` |
+| `APPFOLDER_DIR` | `~/AppFolders` | extracted folder root scanned by `appfolder-sync` |
 | `DESKTOP_DIR` | `~/.local/share/applications` | where entries are written |
 | `ICON_ROOT` | `~/.local/share/icons/hicolor` | icon theme root |
-| `APPMENU_ENTRY_PREFIX` | `appimage` | prefix for generated entry and icon names |
-| `APPMENU_BORDER_COLOR` | `255,0,0` | accent ring colour as `R,G,B` |
-| `APPMENU_BORDER_WIDTH` | `2` | ring width in pixels, `0` disables it |
-| `APPMENU_RADIUS_RATIO` | `0.13` | corner radius as a fraction of icon size, `0` disables it |
+| `APPMENU_ENTRY_PREFIX` | `appimage` | entry and icon name prefix for AppImages |
+| `APPFOLDER_ENTRY_PREFIX` | `appfolder` | entry and icon name prefix for extracted folders |
+| `APPMENU_BORDER_COLOR` | `255,0,0` | AppImage ring colour as `R,G,B` |
+| `APPFOLDER_BORDER_COLOR` | `0,110,255` | folder ring colour as `R,G,B` |
+| `APPMENU_BORDER_WIDTH` / `APPFOLDER_BORDER_WIDTH` | `2` | ring width in pixels, `0` disables |
+| `APPMENU_RADIUS_RATIO` / `APPFOLDER_RADIUS_RATIO` | `0.13` | corner radius as a fraction of icon size, `0` disables |
 
-`appimenu --help` prints the same list.
+`--help` prints the same list for each tool.
 
-## How it works
+## How they work
+
+`appimenu`
 
 1. Candidate filter: filename ends in `.AppImage`, is ELF, and is not a `.part` style temp file.
-2. Offset: `AppImage --appimage-offset` reports where the SquashFS starts; a byte scan for the
-   `hsqs` magic plus a validity check is the fallback for exotic builds. No FUSE, no mount.
+2. Offset: `AppImage --appimage-offset` reports where the SquashFS starts, with a byte scan for the
+   `hsqs` magic plus a validity check as fallback. No FUSE, no mount.
 3. Metadata: `unsquashfs -ll` lists the AppDir once, then only the chosen `.desktop` and icon are
    extracted into a temp dir.
-4. Entry: `<prefix>-<slug>-<hash>.desktop` in `DESKTOP_DIR`, where the hash comes from the file
-   path, so two versions of the same app get two stable entries.
-5. Cleanup: entries carrying `X-AppImage-Sync=true` that are not part of this scan are deleted,
-   along with their icons, unless the AppImage exists but failed inspection (mid-download).
+
+`appfolder-sync`
+
+1. Each subdirectory of the root is a candidate app, descending one level when the parent holds no
+   launcher of its own.
+2. A bundled `.desktop` wins; otherwise the executable whose name matches the folder is used, with
+   helper binaries (`*-launcher`, `*-thumbnailer`, crash handlers, uninstallers) ignored.
+3. Icons are collected to a bounded depth, skipping `lib`, `data`, `docs`, `node_modules` and
+   similar, and anything that is not a real PNG, SVG, ICO or XPM is rejected.
+
+Both write `<prefix>-<name>-<hash>.desktop`, where the hash comes from the app path, so two
+versions of the same app produce two stable entries. Entries carry `X-AppImage-Sync=true` or
+`X-AppFolder-Sync=true` so cleanup can tell generated files from yours.
 
 ## Troubleshooting
 
 - Icons look unchanged in GNOME: the shell caches icon pixmaps, press Super twice or log out and
   back in.
-- No accent ring: install `python3-pil`, or set `APPMENU_BORDER_WIDTH=0` to accept that.
+- No accent ring: install `python3-pil`, or set the border width to `0` to accept that.
 - SVG icon shows no ring: install `librsvg2-bin` for `rsvg-convert`.
-- Nothing appears for a file: it is probably still downloading, or truncated. `appimenu` prints
-  a skip line to stderr in that case.
-- Two identical names: that means two AppImage files are present. Keep one version, or rename the
-  older file you keep out of the scan folder.
+- Nothing appears for an AppImage: it is probably still downloading or truncated, which the tools
+  report on stderr.
+- Nothing appears for a folder: no executable was found in it. If a launcher script lives deeper
+  than two levels, or the binary is not marked executable, fix that rather than the entry.
+- Two identical names: two versions of the app are present. Keep one in the watched folder.
 
 ## Author
 

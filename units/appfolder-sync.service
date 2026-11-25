@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync extracted program folders from ~/AppFolders into the application menu
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/appfolder-sync
+
+[Install]
+WantedBy=default.target

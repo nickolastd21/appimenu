@@ -5,20 +5,28 @@ src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${BINDIR:-$HOME/.local/bin}"
 UNITS="$HOME/.config/systemd/user"
 
-mkdir -p "$BIN" "$UNITS"
-install -m 755 "$src/appimenu" "$BIN/appimenu"
-for unit in service path timer; do
-  install -m 644 "$src/units/appimenu.$unit" "$UNITS/appimenu.$unit"
+tools=("$@")
+[ ${#tools[@]} -eq 0 ] && tools=(appimenu appfolder-sync)
+
+for tool in "${tools[@]}"; do
+  [ -f "$src/$tool" ] || { printf 'unknown tool: %s\n' "$tool" >&2; exit 1; }
+  mkdir -p "$BIN" "$UNITS"
+  install -m 755 "$src/$tool" "$BIN/$tool"
+  for unit in service path timer; do
+    install -m 644 "$src/units/$tool.$unit" "$UNITS/$tool.$unit"
+  done
 done
 
 systemctl --user daemon-reload
-systemctl --user enable appimenu.service appimenu.path appimenu.timer
-systemctl --user start appimenu.path appimenu.timer
-"$BIN/appimenu"
+for tool in "${tools[@]}"; do
+  systemctl --user enable "$tool.service" "$tool.path" "$tool.timer"
+  systemctl --user start "$tool.path" "$tool.timer"
+  "$BIN/$tool"
+done
 
-printf 'installed %s/appimenu and enabled appimenu.{service,path,timer}\n' "$BIN"
-printf 'drop AppImages into %s and the menu updates by itself\n' "${APPIMAGE_DIR:-$HOME/AppImages}"
+printf 'installed %s into %s\n' "${tools[*]}" "$BIN"
+printf 'each tool watches its own folder and updates the menu by itself\n'
 case ":$PATH:" in
   *":$BIN:"*) ;;
-  *) printf 'note: %s is not in PATH, run it as %s/appimenu\n' "$BIN" "$BIN" ;;
+  *) printf 'note: %s is not in PATH, run tools as %s/<tool>\n' "$BIN" "$BIN" ;;
 esac

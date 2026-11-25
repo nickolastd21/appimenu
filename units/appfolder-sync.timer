@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic resync of extracted program folder menu entries
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=10m
+AccuracySec=30s
+Unit=appfolder-sync.service
+
+[Install]
+WantedBy=timers.target

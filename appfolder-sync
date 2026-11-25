@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# appfolder-sync - turn extracted tarball program folders into launcher entries.
+set -uo pipefail
+
+PROG="appfolder-sync"
+VERSION="1.1.0"
+
+APP_DIR="${APPFOLDER_DIR:-$HOME/AppFolders}"
+DESKTOP_DIR="${DESKTOP_DIR:-$HOME/.local/share/applications}"
+ICON_ROOT="${ICON_ROOT:-$HOME/.local/share/icons/hicolor}"
+ENTRY_PREFIX="${APPFOLDER_ENTRY_PREFIX:-appfolder}"
+BORDER_COLOR="${APPFOLDER_BORDER_COLOR:-0,110,255}"
+BORDER_WIDTH="${APPFOLDER_BORDER_WIDTH:-2}"
+RADIUS_RATIO="${APPFOLDER_RADIUS_RATIO:-0.13}"
+
+SYNC_KEY="X-AppFolder-Sync=true"
+SIZES=(16 24 32 48 64 128 256 512)
+PRUNE_DIRS=(lib lib32 lib64 node_modules site-packages data doc docs man locales .git __pycache__ test tests python python3)
+
+find_images() {
+  local dir="$1" d args=()
+  for d in "${PRUNE_DIRS[@]}"; do
+    args+=( -name "$d" -o )
+  done
+  unset 'args[-1]'
+  find "$dir" -mindepth 1 -maxdepth 4 \( "${args[@]}" \) -prune -o -type f \( -iname '*.png' -o -iname '*.svg' -o -iname '*.ico' -o -iname '*.xpm' \) -print 2>/dev/null
+}
+
+find_desktops() {
+  local dir="$1" d args=()
+  for d in "${PRUNE_DIRS[@]}"; do
+    args+=( -name "$d" -o )
+  done
+  unset 'args[-1]'
+  find "$dir" -mindepth 1 -maxdepth 4 \( "${args[@]}" \) -prune -o -type f -iname '*.desktop' -print 2>/dev/null
+}
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$APP_DIR" "$DESKTOP_DIR" "$ICON_ROOT"
+
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+  printf '%s %s - launcher entries for extracted program folders\n\n' "$PROG" "$VERSION"
+  printf 'Usage: %s\n\n' "$PROG"
+  printf 'Scans %s and keeps %s plus icons in %s in sync.\n\n' \
+    "$APP_DIR" "$DESKTOP_DIR" "$ICON_ROOT"
+  printf 'Environment:\n'
+  printf '  APPFOLDER_DIR           folder to scan (default ~/AppFolders)\n'
+  printf '  DESKTOP_DIR             .desktop output dir (default ~/.local/share/applications)\n'
+  printf '  ICON_ROOT               icon theme root (default ~/.local/share/icons/hicolor)\n'
+  printf '  APPFOLDER_ENTRY_PREFIX  entry/icon name prefix (default appfolder)\n'
+  printf '  APPFOLDER_BORDER_COLOR  accent ring RGB (default 0,110,255)\n'
+  printf '  APPFOLDER_BORDER_WIDTH  ring width in px, 0 disables (default 2)\n'
+  printf '  APPFOLDER_RADIUS_RATIO  corner radius as fraction of size, 0 disables (default 0.13)\n'
+  printf '\nNeeds: bash, coreutils. Optional: python3-pillow, rsvg-convert,\n'
+  printf 'gtk-update-icon-cache, update-desktop-database.\n'
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+esac
+
+one_line() {
+  tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-300
+}
+
+desktop_key() {
+  local key="$1" file="$2"
+  [ -f "$file" ] || return 1
+  awk -v k="$key" '
+    { line=$0
+      if (index(line, k "=") == 1 && substr(line, length(k)+1, 1) == "=") {
+        print substr(line, length(k)+2)
+        exit
+      }
+    }
+  ' "$file" | one_line
+}
+
+pretty_name() {
+  local raw="$1" s
+  s=$(printf '%s' "$raw" | sed -E '
+    s/[-_]+/ /g
+    s/[[:space:]]+(linux|macos|windows|portable|snapshot|continuous|release|nightly|final|stable|beta|x86_64|i386|x64|x86|amd64|arm64|aarch64|universal)[[:space:]]+//gI
+    s/[[:space:]]*[a-z]?[0-9]+([._][0-9]+)*(-[0-9]+)?[[:space:]]+//gI
+    s/[[:space:]]*[a-z]?[0-9]+([._][0-9]+)*(-[0-9]+)?$//gI
+    s/^[[:space:]]+//; s/[[:space:]]+$//
+  ')
+  [ -n "$s" ] || s="$raw"
+  printf '%s' "$s" | awk '{ for (i=1; i<=NF; i++) $i = toupper(substr($i,1,1)) substr($i,2) }1'
+}
+
+slug() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40
+}
+
+id_for() {
+  local path="$1" hash
+  hash=$(printf '%s' "$path" | md5sum | cut -c1-8)
+  printf '%s-%s-%s' "$ENTRY_PREFIX" "$(slug "$(basename "$path")")" "$hash" | sed -E 's/-+$//' | cut -c1-70
+}
+
+is_elf_executable() {
+  local f="$1" magic
+  [ -x "$f" ] || return 1
+  magic=$(od -An -N4 -tx1 "$f" 2>/dev/null | tr -d ' ')
+  [ "$magic" = "7f454c46" ]
+}
+
+helper_name() {
+  local low="${1,,}"
+  case "$low" in
+    *launcher*|*thumbnailer*|*symbolic*|*system-info*|*crash*|*updater*|*uninstall*|*helper*|*benchmark*|*tests*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_image() {
+  case "${1,,}" in
+    *.png|*.svg|*.ico|*.xpm) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+readable_image() {
+  local f="$1" head magic
+  head=$(head -c 16 "$f" 2>/dev/null | tr -d '\000-\037')
+  magic=$(od -An -N4 -tx1 "$f" 2>/dev/null | tr -d ' ')
+  case "$magic" in
+    89504e47|00000100) return 0 ;;
+  esac
+  head -c 512 "$f" 2>/dev/null | grep -q '<svg' && return 0
+  head -c 6 "$f" 2>/dev/null | grep -q 'XPM' && return 0
+  case "$head" in *svg*) return 0 ;; esac
+  return 1
+}
+
+root_level() {
+  local dir="$1"
+  while IFS= read -r f; do
+    case "${f#$dir/}" in */*) ;; *) printf '%s\n' "$f" ;; esac
+  done
+}
+
+is_app_dir() {
+  local dir="$1" f
+  while IFS= read -r f; do
+    [ -n "$f" ] && return 0
+  done < <(find_desktops "$dir" | head -1)
+  while IFS= read -r f; do
+    is_elf_executable "$f" || continue
+    helper_name "$(basename "$f")" && continue
+    return 0
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -perm -u+x 2>/dev/null)
+  return 1
+}
+
+discover_apps() {
+  local dir child
+  while IFS= read -r dir; do
+    if is_app_dir "$dir"; then
+      printf '%s\n' "$dir"
+      continue
+    fi
+    while IFS= read -r child; do
+      is_app_dir "$child" && printf '%s\n' "$child"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.??*' 2>/dev/null)
+  done < <(find "$APP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.??*' ! -name 'squashfs-root' 2>/dev/null)
+}
+
+pick_desktop() {
+  local stem="$1" best="" cand low
+  local want="${stem,,}"
+  while IFS= read -r cand; do
+    low=$(basename "$cand" | tr 'A-Z' 'a-z')
+    [ "$low" = "$want.desktop" ] && { printf '%s\n' "$cand"; return 0; }
+    [ -z "$best" ] && best="$cand"
+  done
+  [ -n "$best" ] && printf '%s\n' "$best" && return 0
+  return 1
+}
+
+exec_token() {
+  local dir="$1" line="$2" token rest
+  token="${line%% *}"
+  rest="${line#"$token"}"
+  token="${token%\"}"
+  token="${token#\"}"
+  case "$token" in
+    /*) printf '%s%s' "$(shell_quote "$token")" "$rest" ;;
+    *) printf '%s%s' "$(shell_quote "$(realpath -m "$dir/$token")")" "$rest" ;;
+  esac
+}
+
+shell_quote() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//\`/\\\`}
+  s=${s//\$/\\\$}
+  printf '"%s"' "$s"
+}
+
+find_executable() {
+  local dir="$1" stem="$2" want="${2,,}" match="" fallback="" cand base
+  for depth in 1 2; do
+    while IFS= read -r cand; do
+      base=$(basename "$cand")
+      is_elf_executable "$cand" || continue
+      helper_name "$base" && continue
+      [ "${base,,}" = "$want" ] && { printf '%s\n' "$cand"; return 0; }
+      [ -z "$match" ] && match="$cand"
+      [ -z "$fallback" ] && fallback="$cand"
+    done < <(find "$dir" -mindepth 1 -maxdepth "$depth" -type f -perm -u+x 2>/dev/null | sort)
+    [ -n "$match" ] || [ -n "$fallback" ] && break
+  done
+  [ -n "$match" ] && printf '%s\n' "$match" && return 0
+  [ -n "$fallback" ] && printf '%s\n' "$fallback" && return 0
+  return 1
+}
+
+pick_icon() {
+  local dir="$1" hint="$2" stem="$3" best="" cand low wantroot images=()
+  hint="${hint##*/}"
+  hint="${hint%.*}"
+  hint="${hint,,}"
+  stem="${stem,,}"
+  local cand_all
+  while IFS= read -r cand_all; do
+    readable_image "$cand_all" && images+=("$cand_all")
+  done < <(find_images "$dir")
+  [ ${#images[@]} -eq 0 ] && return 1
+  for cand in "${images[@]}"; do
+    low="${cand##*/}"; low="${low%.*}"; low="${low,,}"
+    [ "$low" = "$hint" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  for cand in "${images[@]}"; do
+    low="${cand##*/}"; low="${low%.*}"; low="${low,,}"
+    [ "$low" = "$stem" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  for cand in "${images[@]}"; do
+    wantroot="${cand#"$dir"/}"
+    case "$wantroot" in */*) continue ;; esac
+    is_image "$cand" && [ -z "$best" ] && best="$cand"
+  done
+  [ -n "$best" ] && printf '%s\n' "$best" && return 0
+  printf '%s\n' "${images[0]}"
+  return 0
+}
+
+icon_bucket() {
+  local img="$1" w=0 size
+  w=$(od -An -j16 -N4 -tu4 --endian=big "$img" 2>/dev/null | tr -d ' ') || w=""
+  case "$w" in ''|*[!0-9]*) w=256 ;; esac
+  [ "$w" -lt 1 ] && w=256
+  if [ "$w" -ge 512 ]; then printf '512x512'; return; fi
+  for size in "${SIZES[@]}"; do
+    if [ "$w" -le "$size" ]; then printf '%sx%s' "$size" "$size"; return; fi
+  done
+  printf '512x512'
+}
+
+draw_accent_border() {
+  [ "$BORDER_WIDTH" -gt 0 ] 2>/dev/null || return 1
+  python3 - "$1" "$BORDER_COLOR" "$BORDER_WIDTH" "$RADIUS_RATIO" <<'ACCENT' || return 1
+import sys
+try:
+    from PIL import Image, ImageDraw
+except Exception:
+    sys.exit(1)
+path, color, width, ratio = sys.argv[1:5]
+try:
+    red, green, blue = (int(v) for v in color.split(","))
+    width = int(width)
+    ratio = float(ratio)
+except Exception:
+    sys.exit(1)
+try:
+    image = Image.open(path).convert("RGBA")
+except Exception:
+    sys.exit(1)
+size = image.size
+side = max(size)
+radius = max(3, int(round(side * ratio))) if ratio > 0 else 0
+thickness = min(8, max(width, int(round(side * width / 128.0))))
+if radius > 0:
+    scale = 4
+    mask = Image.new("L", (size[0] * scale, size[1] * scale), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, size[0] * scale - 1, size[1] * scale - 1),
+        radius=radius * scale,
+        fill=255,
+    )
+    mask = mask.resize(size, Image.LANCZOS)
+    image = Image.composite(image, Image.new("RGBA", size, (0, 0, 0, 0)), mask)
+ImageDraw.Draw(image).rounded_rectangle(
+    (0, 0, size[0] - 1, size[1] - 1),
+    radius=max(2, radius),
+    outline=(red, green, blue, 255),
+    width=thickness,
+)
+image.save(path, "PNG")
+ACCENT
+}
+
+install_icon() {
+  local id="$1" img="$2" ext bucket dir target work
+  ext="${img##*.}"
+  ext=$(printf '%s' "$ext" | tr 'A-Z' 'a-z')
+  work="$TMP/$id.icon"
+  if [ "$ext" = svg ] || head -c 512 "$img" | grep -q "<svg"; then
+    ext=svg
+    bucket="scalable"
+    if rsvg-convert -w 256 -h 256 --keep-aspect-ratio -o "$work" "$img" 2>/dev/null; then
+      ext=png
+      bucket="256x256"
+    else
+      cp -f "$img" "$work" 2>/dev/null || return 1
+    fi
+  else
+    cp -f "$img" "$work" 2>/dev/null || return 1
+    bucket="$(icon_bucket "$img")"
+  fi
+  if draw_accent_border "$work"; then
+    ext=png
+  fi
+  dir="$ICON_ROOT/$bucket/apps"
+  mkdir -p "$dir"
+  target="$dir/$id.$ext"
+  cp -f "$work" "$target" 2>/dev/null || { warn "could not install icon for $id"; return 1; }
+  printf '%s' "$target"
+}
+
+write_entry() {
+  local file="$1" tmp="$TMP/entry.desktop"
+  cat > "$tmp"
+  if [ -f "$file" ] && cmp -s "$tmp" "$file"; then return 1; fi
+  install -m 644 "$tmp" "$file"
+  return 0
+}
+
+sync_one() {
+  local dir="$1" id stem desktop_src exec_line icon_src icon_path="" icon_hint
+  local name generic comment categories keywords mimetype terminal startup_notify wmclass gpu entry newfile exe
+
+  dir=$(realpath "$dir")
+  id=$(id_for "$dir")
+  stem=$(basename "$dir")
+
+  desktop_src=$(find_desktops "$dir" | root_level "$dir" | pick_desktop "$stem") || desktop_src=""
+  if [ -z "$desktop_src" ]; then
+    desktop_src=$(find_desktops "$dir" | head -1) || desktop_src=""
+  fi
+
+  if [ -n "$desktop_src" ]; then
+    exec_line=$(desktop_key Exec "$desktop_src") || exec_line=""
+  else
+    exec_line=""
+  fi
+  if [ -z "$exec_line" ]; then
+    exe=$(find_executable "$dir" "$stem") || exe=""
+    [ -z "$exe" ] && { warn "skipped ${dir}: no launcher binary found"; printf '%s\n' "$dir" >> "$TMP/skip"; return 1; }
+    exec_line="$exe"
+  fi
+  exec_line=$(exec_token "$dir" "$exec_line")
+
+  icon_hint=$(desktop_key Icon "${desktop_src:-/dev/null}") || icon_hint=""
+  icon_src=$(pick_icon "$dir" "$icon_hint" "$stem") || icon_src=""
+  [ -n "$icon_src" ] && icon_path=$(install_icon "$id" "$icon_src") || icon_path=""
+
+  name=$(desktop_key Name "${desktop_src:-/dev/null}") || name=""
+  generic=$(desktop_key GenericName "${desktop_src:-/dev/null}") || generic=""
+  comment=$(desktop_key Comment "${desktop_src:-/dev/null}") || comment=""
+  categories=$(desktop_key Categories "${desktop_src:-/dev/null}") || categories=""
+  keywords=$(desktop_key Keywords "${desktop_src:-/dev/null}") || keywords=""
+  mimetype=$(desktop_key MimeType "${desktop_src:-/dev/null}") || mimetype=""
+  terminal=$(desktop_key Terminal "${desktop_src:-/dev/null}") || terminal=""
+  startup_notify=$(desktop_key StartupNotify "${desktop_src:-/dev/null}") || startup_notify=""
+  wmclass=$(desktop_key StartupWMClass "${desktop_src:-/dev/null}") || wmclass=""
+  gpu=$(desktop_key PrefersNonDefaultGPU "${desktop_src:-/dev/null}") || gpu=""
+
+  [ -n "$name" ] || name=$(pretty_name "$stem")
+  [ -n "$comment" ] || comment="Extracted app: $stem"
+  [ "$comment" = "$name" ] && comment="Extracted app: $stem"
+  [ -n "$categories" ] || categories="Utility;"
+  categories=$(printf '%s' "${categories:-}" | tr ';' '\n' | grep -v '^$' | grep -vi '^application$' | paste -sd ';' -)
+  [ -n "$categories" ] || categories="Utility"
+  case "$categories" in
+    *";") ;;
+    *) categories="$categories;" ;;
+  esac
+  [ -n "$terminal" ] || terminal=false
+  [ -n "$startup_notify" ] || startup_notify=true
+
+  entry=$(printf '%s\n' \
+    "[Desktop Entry]" \
+    "Type=Application" \
+    "Name=$name" \
+    "Comment=$comment" \
+    "Exec=$exec_line" \
+    "Path=$dir" \
+    "Icon=${icon_path:-application-x-executable}" \
+    "Terminal=$terminal" \
+    "StartupNotify=$startup_notify" \
+    "Categories=$categories" \
+    ${generic:+"GenericName=$generic"} \
+    ${keywords:+"Keywords=$keywords"} \
+    ${mimetype:+"MimeType=$mimetype"} \
+    ${wmclass:+"StartupWMClass=$wmclass"} \
+    ${gpu:+"PrefersNonDefaultGPU=$gpu"} \
+    "$SYNC_KEY" \
+    "X-AppFolder-Path=$dir")
+
+  printf '%s\n' "$id" >> "$TMP/keep"
+  [ -n "${icon_path:-}" ] && printf '%s\n' "$icon_path" >> "$TMP/icons"
+  newfile="$DESKTOP_DIR/$id.desktop"
+  write_entry "$newfile" <<< "$entry" >/dev/null
+  printf '%s\n' "$dir"
+}
+
+cleanup_stale() {
+  local keep="$TMP/keep" f id icon source
+  [ -f "$keep" ] || : > "$keep"
+  for f in "$DESKTOP_DIR"/"$ENTRY_PREFIX"-*.desktop; do
+    [ -e "$f" ] || continue
+    grep -q "^$SYNC_KEY$" "$f" || continue
+    id=$(basename "$f")
+    id="${id%.desktop}"
+    grep -Fxq "$id" "$keep" && continue
+    icon=$(desktop_key Icon "$f") || icon=""
+    source=$(desktop_key X-AppFolder-Path "$f") || source=""
+    if [ -n "$source" ] && [ -d "$source" ] && [ -f "$TMP/skip" ] && grep -Fxq "$source" "$TMP/skip"; then
+      case "$icon" in "$ICON_ROOT"/*) printf '%s\n' "$icon" >> "$TMP/icons" ;; esac
+      continue
+    fi
+    case "$icon" in "$ICON_ROOT"/*) rm -f "$icon" ;; esac
+    rm -f "$f"
+    printf 'removed %s\n' "$id"
+  done
+}
+
+main() {
+  : > "$TMP/keep"
+  : > "$TMP/icons"
+  : > "$TMP/skip"
+  local count=0 removed orphan=0 icon
+  while IFS= read -r dir; do
+    if sync_one "$dir" > /dev/null; then
+      count=$((count + 1))
+    fi
+  done < <(discover_apps)
+
+  removed=$(cleanup_stale | wc -l)
+  while IFS= read -r icon; do
+    grep -Fxq "$icon" "$TMP/icons" || { rm -f "$icon"; orphan=$((orphan + 1)); }
+  done < <(find "$ICON_ROOT" \( -type f -name "$ENTRY_PREFIX-*.png" \) -o \( -type f -name "$ENTRY_PREFIX-*.svg" \) 2>/dev/null)
+  [ "$orphan" -gt 0 ] && printf 'removed %s orphan icon(s)\n' "$orphan"
+  gtk-update-icon-cache -q -t -f "$ICON_ROOT" 2>/dev/null || true
+  update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  printf 'scanned %s: %s folder entry(s) up to date, %s stale entry(s) removed\n' "$APP_DIR" "$count" "$removed"
+}
+
+main "$@"
